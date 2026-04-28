@@ -132,6 +132,20 @@ jobs:
 
             echo "==> Done. Current state:"
             kubectl get all -n spur
+
+            echo "==> Verify: Raft leader election"
+            kubectl logs -n spur spurctld-0 | grep -i leader || echo "No leader log yet"
+
+            echo "==> Verify: Operator node registration"
+            kubectl logs -n spur deploy/spur-k8s-operator | grep -i register || echo "No registration log yet"
+
+            echo "==> Verify: Health checks"
+            kubectl port-forward -n spur deploy/spur-k8s-operator 8080:8080 &
+            PF_PID=$!
+            sleep 3
+            curl -sf http://localhost:8080/healthz && echo "healthz OK" || echo "healthz FAILED"
+            curl -sf http://localhost:8080/readyz && echo "readyz OK" || echo "readyz FAILED"
+            kill $PF_PID
           ENDSSH
 
   # ── 3. Sync from upstream ROCm/spur ──────────────────────────
