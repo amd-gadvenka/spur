@@ -14,7 +14,7 @@ jobs:
   # ── 1. Build the Docker image ─────────────────────────────────
   build:
     name: Build & Push Image
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     if: github.event_name != 'schedule'
     outputs:
       image_tag: ${{ steps.tag.outputs.value }}
@@ -51,7 +51,7 @@ jobs:
   # ── 2. Deploy to Kubernetes ───────────────────────────────────
   deploy:
     name: Deploy to Kubernetes
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: build
     environment: production
 
@@ -151,7 +151,7 @@ jobs:
   # ── 3. Sync from upstream ROCm/spur ──────────────────────────
   sync-upstream:
     name: Sync from ROCm/spur
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     if: github.event_name == 'schedule'
 
     steps:
