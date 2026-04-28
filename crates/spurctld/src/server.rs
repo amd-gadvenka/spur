@@ -935,6 +935,9 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             Some(spec.array_spec)
         },
+        array_job_id: None,
+        array_task_id: None,
+        array_max_concurrent: None,
         requeue: spec.requeue,
         exclusive: spec.exclusive,
         hold: spec.hold,
@@ -1119,8 +1122,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         resources: job.allocated_resources.as_ref().map(resource_to_proto),
         priority: job.priority,
         qos: job.spec.qos.clone().unwrap_or_default(),
-        array_job_id: job.array_job_id.unwrap_or(0),
-        array_task_id: job.array_task_id.unwrap_or(0),
+        array_job_id: job.spec.array_job_id.unwrap_or(0),
+        array_task_id: job.spec.array_task_id.unwrap_or(0),
     }
 }
 
@@ -1171,7 +1174,9 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
     }
 }
 
-fn resource_to_proto(r: &spur_core::resource::ResourceSet) -> spur_proto::proto::ResourceSet {
+pub(crate) fn resource_to_proto(
+    r: &spur_core::resource::ResourceSet,
+) -> spur_proto::proto::ResourceSet {
     spur_proto::proto::ResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
@@ -1200,7 +1205,7 @@ fn resource_to_proto(r: &spur_core::resource::ResourceSet) -> spur_proto::proto:
     }
 }
 
-fn job_state_to_proto(s: spur_core::job::JobState) -> spur_proto::proto::JobState {
+pub(crate) fn job_state_to_proto(s: spur_core::job::JobState) -> spur_proto::proto::JobState {
     match s {
         spur_core::job::JobState::Pending => spur_proto::proto::JobState::JobPending,
         spur_core::job::JobState::Running => spur_proto::proto::JobState::JobRunning,
@@ -1229,7 +1234,7 @@ fn node_state_to_proto(s: spur_core::node::NodeState) -> spur_proto::proto::Node
     }
 }
 
-fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+pub(crate) fn datetime_to_proto(dt: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,

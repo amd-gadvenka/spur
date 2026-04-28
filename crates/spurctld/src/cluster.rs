@@ -17,6 +17,7 @@ use spur_core::resource::ResourceSet;
 use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 
+use crate::accounting::AccountingNotifier;
 use crate::raft::{SpurRaft, StateMachineApply};
 
 /// Central cluster state manager.
@@ -34,6 +35,7 @@ pub struct ClusterManager {
     license_pool: RwLock<HashMap<String, u64>>,
     hostname_aliases: RwLock<HashMap<String, String>>,
     raft: RwLock<Option<SpurRaft>>,
+    accounting: RwLock<Option<AccountingNotifier>>,
 }
 
 impl ClusterManager {
@@ -52,6 +54,7 @@ impl ClusterManager {
             license_pool: RwLock::new(license_pool),
             hostname_aliases: RwLock::new(HashMap::new()),
             raft: RwLock::new(None),
+            accounting: RwLock::new(None),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -61,75 +64,26 @@ impl ClusterManager {
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
     pub fn submit_job(&self, mut spec: JobSpec) -> anyhow::Result<JobId> {
-        // If no partition specified, assign the default partition.
-        if spec.partition.is_none() {
-            let partitions = self.partitions.read();
-            if let Some(default_part) = partitions.iter().find(|p| p.is_default) {
-                spec.partition = Some(default_part.name.clone());
-            } else if let Some(first) = partitions.first() {
-                spec.partition = Some(first.name.clone());
-            }
-        }
-
-        // Validate partition constraints before accepting the job
+        apply_default_partition(&mut spec, &self.partitions.read());
         self.validate_partition(&spec)?;
 
-        // Check for array job
-        if let Some(ref array_spec) = spec.array_spec {
-            return self.submit_array_job(spec.clone(), array_spec);
-        }
-
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let specs = expand_job_specs(spec, job_id)?;
 
-        self.propose(WalOperation::JobSubmit {
-            job_id,
-            spec: spec.clone(),
-        })?;
-
-        info!(job_id, name = %spec.name, user = %spec.user, "job submitted");
-        Ok(job_id)
-    }
-
-    /// Submit an array job — expands the spec into individual task jobs.
-    fn submit_array_job(&self, spec: JobSpec, array_spec_str: &str) -> anyhow::Result<JobId> {
-        use spur_core::array::parse_array_spec;
-
-        let array = parse_array_spec(array_spec_str)
-            .map_err(|e| anyhow::anyhow!("invalid array spec: {}", e))?;
-
-        let array_job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let mut jobs = self.jobs.write();
-
-        info!(
-            array_job_id,
-            tasks = array.task_ids.len(),
-            max_concurrent = array.max_concurrent,
-            name = %spec.name,
-            "array job submitted"
-        );
-
-        for &task_id in &array.task_ids {
-            let task_job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-            let mut task_spec = spec.clone();
-            task_spec.array_spec = None; // Don't recurse
-
+        for task_spec in specs {
+            let task_id = if task_spec.array_job_id.is_some() {
+                self.next_job_id.fetch_add(1, Ordering::SeqCst)
+            } else {
+                job_id
+            };
             self.propose(WalOperation::JobSubmit {
-                job_id: task_job_id,
-                spec: task_spec.clone(),
+                job_id: task_id,
+                spec: task_spec,
             })?;
-
-            let mut job = Job::new(task_job_id, task_spec);
-            job.array_job_id = Some(array_job_id);
-            job.array_task_id = Some(task_id);
-            if array.max_concurrent > 0 {
-                job.array_max_concurrent = Some(array.max_concurrent);
-            }
-
-            jobs.insert(task_job_id, job);
         }
 
-        // Return the array job ID (first task IDs are array_job_id + 1, +2, ...)
-        Ok(array_job_id)
+        info!(job_id, "job submitted");
+        Ok(job_id)
     }
 
     /// Validate partition constraints: access control and node limits.
@@ -341,6 +295,17 @@ impl ClusterManager {
             self.send_notification(job_id, "BEGIN", &spec_for_notify);
         }
 
+        if let Some(ref notifier) = *self.accounting.read() {
+            notifier.notify_job_start(
+                job_id,
+                spec_for_notify.user.clone(),
+                spec_for_notify.account.clone().unwrap_or_default(),
+                spec_for_notify.partition.clone().unwrap_or_default(),
+                &resources,
+                Utc::now(),
+            );
+        }
+
         debug!(job_id, "job started");
         Ok(())
     }
@@ -385,6 +350,10 @@ impl ClusterManager {
             if is_failure && spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
                 self.send_notification(job_id, "FAIL", &spec);
             }
+        }
+
+        if let Some(ref notifier) = *self.accounting.read() {
+            notifier.notify_job_end(job_id, state, exit_code, Utc::now());
         }
 
         let should_requeue = matches!(
@@ -877,7 +846,7 @@ impl ClusterManager {
             let mut counts = std::collections::HashMap::new();
             for j in jobs.values() {
                 if j.state == JobState::Running {
-                    if let Some(aid) = j.array_job_id {
+                    if let Some(aid) = j.spec.array_job_id {
                         *counts.entry(aid).or_insert(0) += 1;
                     }
                 }
@@ -885,7 +854,7 @@ impl ClusterManager {
             counts
         };
         pending.retain(|job| {
-            if let (Some(aid), Some(max)) = (job.array_job_id, job.array_max_concurrent) {
+            if let (Some(aid), Some(max)) = (job.spec.array_job_id, job.spec.array_max_concurrent) {
                 let running = running_array_counts.get(&aid).copied().unwrap_or(0);
                 if running >= max {
                     return false; // Throttled — too many siblings running
@@ -1289,6 +1258,10 @@ impl ClusterManager {
         *self.raft.write() = Some(raft);
     }
 
+    pub fn set_accounting(&self, notifier: AccountingNotifier) {
+        *self.accounting.write() = Some(notifier);
+    }
+
     /// Persist a mutation via Raft consensus. The apply callback
     /// (`StateMachineApply`) handles in-memory state on all nodes.
     fn propose(&self, op: WalOperation) -> anyhow::Result<()> {
@@ -1589,7 +1562,7 @@ impl StateMachineApply for ClusterManager {
         self.apply_operation(op);
     }
 
-    fn snapshot_state(&self) -> Vec<u8> {
+    fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
         let snap = ClusterSnapshot {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
@@ -1598,7 +1571,7 @@ impl StateMachineApply for ClusterManager {
             license_pool: self.license_pool.read().clone(),
             hostname_aliases: self.hostname_aliases.read().clone(),
         };
-        serde_json::to_vec(&snap).unwrap_or_default()
+        serde_json::to_vec(&snap).map_err(Into::into)
     }
 
     fn restore_from_snapshot(&self, data: &[u8]) {
@@ -1722,6 +1695,47 @@ pub(crate) fn evaluate_node_health(
         }
     }
     actions
+}
+
+fn apply_default_partition(spec: &mut JobSpec, partitions: &[Partition]) {
+    if spec.partition.is_none() {
+        if let Some(default_part) = partitions.iter().find(|p| p.is_default) {
+            spec.partition = Some(default_part.name.clone());
+        } else if let Some(first) = partitions.first() {
+            spec.partition = Some(first.name.clone());
+        }
+    }
+}
+
+/// Expand a job spec into one or more submittable specs. For non-array jobs,
+/// returns the spec unchanged. For array jobs, returns N task specs with
+/// array metadata populated and `array_spec` cleared.
+fn expand_job_specs(spec: JobSpec, parent_job_id: JobId) -> anyhow::Result<Vec<JobSpec>> {
+    let Some(ref array_spec_str) = spec.array_spec else {
+        return Ok(vec![spec]);
+    };
+
+    let array = spur_core::array::parse_array_spec(array_spec_str)
+        .map_err(|e| anyhow::anyhow!("invalid array spec: {}", e))?;
+
+    let max_concurrent = if array.max_concurrent > 0 {
+        Some(array.max_concurrent)
+    } else {
+        None
+    };
+
+    Ok(array
+        .task_ids
+        .iter()
+        .map(|&task_id| {
+            let mut task_spec = spec.clone();
+            task_spec.array_spec = None;
+            task_spec.array_job_id = Some(parent_job_id);
+            task_spec.array_task_id = Some(task_id);
+            task_spec.array_max_concurrent = max_concurrent;
+            task_spec
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -2125,7 +2139,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         submit_and_wait(&cm, basic_spec("snap-job"));
 
-        let data = cm.snapshot_state();
+        let data = cm.snapshot_state().unwrap();
         assert!(!data.is_empty());
 
         // Create a fresh cluster and restore
@@ -2522,5 +2536,100 @@ mod tests {
             super::evaluate_registration(Some(&node), &new),
             super::RegistrationAction::Update,
         );
+    }
+
+    // --- expand_job_specs tests ---
+
+    #[test]
+    fn expand_non_array_returns_single_spec() {
+        let spec = basic_spec("simple");
+        let result = super::expand_job_specs(spec, 1).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "simple");
+        assert!(result[0].array_job_id.is_none());
+        assert!(result[0].array_task_id.is_none());
+        assert!(result[0].array_max_concurrent.is_none());
+    }
+
+    #[test]
+    fn expand_array_with_throttle() {
+        let mut spec = basic_spec("arr");
+        spec.array_spec = Some("0-4%2".into());
+        let result = super::expand_job_specs(spec, 10).unwrap();
+        assert_eq!(result.len(), 5);
+        for (i, s) in result.iter().enumerate() {
+            assert_eq!(s.array_job_id, Some(10));
+            assert_eq!(s.array_task_id, Some(i as u32));
+            assert_eq!(s.array_max_concurrent, Some(2));
+            assert!(s.array_spec.is_none());
+            assert_eq!(s.name, "arr");
+        }
+    }
+
+    #[test]
+    fn expand_array_without_throttle() {
+        let mut spec = basic_spec("arr");
+        spec.array_spec = Some("0-4".into());
+        let result = super::expand_job_specs(spec, 5).unwrap();
+        assert_eq!(result.len(), 5);
+        for s in &result {
+            assert_eq!(s.array_job_id, Some(5));
+            assert!(s.array_max_concurrent.is_none());
+        }
+    }
+
+    #[test]
+    fn expand_array_invalid_spec_errors() {
+        let mut spec = basic_spec("bad");
+        spec.array_spec = Some("10-5".into());
+        assert!(super::expand_job_specs(spec, 1).is_err());
+    }
+
+    // --- apply_default_partition tests ---
+
+    #[test]
+    fn apply_default_partition_picks_default() {
+        let mut spec = basic_spec("j");
+        spec.partition = None;
+        let partitions = vec![
+            Partition {
+                name: "other".into(),
+                is_default: false,
+                ..Default::default()
+            },
+            Partition {
+                name: "gpu".into(),
+                is_default: true,
+                ..Default::default()
+            },
+        ];
+        super::apply_default_partition(&mut spec, &partitions);
+        assert_eq!(spec.partition.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn apply_default_partition_falls_back_to_first() {
+        let mut spec = basic_spec("j");
+        spec.partition = None;
+        let partitions = vec![Partition {
+            name: "batch".into(),
+            is_default: false,
+            ..Default::default()
+        }];
+        super::apply_default_partition(&mut spec, &partitions);
+        assert_eq!(spec.partition.as_deref(), Some("batch"));
+    }
+
+    #[test]
+    fn apply_default_partition_noop_when_set() {
+        let mut spec = basic_spec("j");
+        spec.partition = Some("mypart".into());
+        let partitions = vec![Partition {
+            name: "default".into(),
+            is_default: true,
+            ..Default::default()
+        }];
+        super::apply_default_partition(&mut spec, &partitions);
+        assert_eq!(spec.partition.as_deref(), Some("mypart"));
     }
 }
