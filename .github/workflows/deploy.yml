@@ -63,8 +63,14 @@ jobs:
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
         run: |
+          echo "IMAGE_TAG=${IMAGE_TAG}"
+          if [ -z "${IMAGE_TAG}" ]; then
+            echo "ERROR: IMAGE_TAG is empty"
+            exit 1
+          fi
           find deploy/k8s -name '*.yaml' | xargs sed -i \
             "s|image: spur:latest|image: ${IMAGE_TAG}|g"
+          grep -r "image:" deploy/k8s/
 
       - name: Rebuild CRD generator
         run: |
