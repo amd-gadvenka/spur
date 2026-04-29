@@ -59,14 +59,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.K8S_SSH_PRIVATE_KEY }}
-
-      - name: Trust the k8s host
-        run: ssh-keyscan -H ${{ secrets.K8S_SSH_HOST }} >> ~/.ssh/known_hosts
-
       - name: Patch image tag in manifests
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
@@ -74,79 +66,59 @@ jobs:
           find deploy/k8s -name '*.yaml' | xargs sed -i \
             "s|image: spur:latest|image: ${IMAGE_TAG}|g"
 
-      - name: Copy manifests to server
-        env:
-          HOST: ${{ secrets.K8S_SSH_HOST }}
-          USER: ${{ secrets.K8S_SSH_USER }}
+      - name: Rebuild CRD generator
         run: |
-          ssh ${USER}@${HOST} "mkdir -p /tmp/spur-deploy/k8s"
-          scp -r deploy/k8s/* ${USER}@${HOST}:/tmp/spur-deploy/k8s/
+          cargo build --release --bin spur-k8s-operator
 
-      - name: Rebuild CRD generator on server
+      - name: Deploy to Kubernetes
         env:
-          HOST: ${{ secrets.K8S_SSH_HOST }}
-          USER: ${{ secrets.K8S_SSH_USER }}
-        run: |
-          ssh ${USER}@${HOST} bash -s << 'ENDSSH'
-            cd ~/spur
-            git pull origin main
-            cargo build --release --bin spur-k8s-operator
-          ENDSSH
-
-      - name: Deploy on k8s node
-        env:
-          HOST: ${{ secrets.K8S_SSH_HOST }}
-          USER: ${{ secrets.K8S_SSH_USER }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
         run: |
-          ssh ${USER}@${HOST} bash -s << 'ENDSSH'
-            set -euo pipefail
-            DEPLOY_DIR=/tmp/spur-deploy
+          set -euo pipefail
 
-            echo "==> 1. Namespace"
-            kubectl apply -f $DEPLOY_DIR/k8s/namespace.yaml
+          echo "==> 1. Namespace"
+          kubectl apply -f deploy/k8s/namespace.yaml
 
-            echo "==> 2. RBAC"
-            kubectl apply -f $DEPLOY_DIR/k8s/rbac.yaml
+          echo "==> 2. RBAC"
+          kubectl apply -f deploy/k8s/rbac.yaml
 
-            echo "==> 3. SpurJob CRD"
-            ~/spur/target/release/spur-k8s-operator generate-crd | kubectl apply -f -
+          echo "==> 3. SpurJob CRD"
+          ./target/release/spur-k8s-operator generate-crd | kubectl apply -f -
 
-            echo "==> 4. ConfigMap"
-            kubectl apply -f $DEPLOY_DIR/k8s/configmap.yaml
+          echo "==> 4. ConfigMap"
+          kubectl apply -f deploy/k8s/configmap.yaml
 
-            echo "==> 5. Accounting daemon"
-            kubectl apply -f $DEPLOY_DIR/k8s/spurdbd.yaml
+          echo "==> 5. Accounting daemon"
+          kubectl apply -f deploy/k8s/spurdbd.yaml
 
-            echo "==> 6. Controller + PDB"
-            kubectl apply -f $DEPLOY_DIR/k8s/spurctld.yaml
-            kubectl apply -f $DEPLOY_DIR/k8s/pdb.yaml
-            kubectl rollout status statefulset/spurctld -n spur --timeout=180s
+          echo "==> 6. Controller + PDB"
+          kubectl apply -f deploy/k8s/spurctld.yaml
+          kubectl apply -f deploy/k8s/pdb.yaml
+          kubectl rollout status statefulset/spurctld -n spur --timeout=180s
 
-            echo "==> 7. REST API"
-            kubectl apply -f $DEPLOY_DIR/k8s/spurrestd.yaml
+          echo "==> 7. REST API"
+          kubectl apply -f deploy/k8s/spurrestd.yaml
 
-            echo "==> 8. Operator"
-            kubectl apply -f $DEPLOY_DIR/k8s/operator.yaml
-            kubectl rollout status deployment/spur-k8s-operator -n spur --timeout=120s
+          echo "==> 8. Operator"
+          kubectl apply -f deploy/k8s/operator.yaml
+          kubectl rollout status deployment/spur-k8s-operator -n spur --timeout=120s
 
-            echo "==> Done. Current state:"
-            kubectl get all -n spur
+          echo "==> Done. Current state:"
+          kubectl get all -n spur
 
-            echo "==> Verify: Raft leader election"
-            kubectl logs -n spur spurctld-0 | grep -i leader || echo "No leader log yet"
+          echo "==> Verify: Raft leader election"
+          kubectl logs -n spur spurctld-0 | grep -i leader || echo "No leader log yet"
 
-            echo "==> Verify: Operator node registration"
-            kubectl logs -n spur deploy/spur-k8s-operator | grep -i register || echo "No registration log yet"
+          echo "==> Verify: Operator node registration"
+          kubectl logs -n spur deploy/spur-k8s-operator | grep -i register || echo "No registration log yet"
 
-            echo "==> Verify: Health checks"
-            kubectl port-forward -n spur deploy/spur-k8s-operator 8080:8080 &
-            PF_PID=$!
-            sleep 3
-            curl -sf http://localhost:8080/healthz && echo "healthz OK" || echo "healthz FAILED"
-            curl -sf http://localhost:8080/readyz && echo "readyz OK" || echo "readyz FAILED"
-            kill $PF_PID
-          ENDSSH
+          echo "==> Verify: Health checks"
+          kubectl port-forward -n spur deploy/spur-k8s-operator 8080:8080 &
+          PF_PID=$!
+          sleep 3
+          curl -sf http://localhost:8080/healthz && echo "healthz OK" || echo "healthz FAILED"
+          curl -sf http://localhost:8080/readyz && echo "readyz OK" || echo "readyz FAILED"
+          kill $PF_PID
 
   # ── 3. Sync from upstream ROCm/spur ──────────────────────────
   sync-upstream:
