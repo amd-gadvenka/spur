@@ -21,38 +21,54 @@ use tracing::{debug, info, warn};
 const DEFAULT_IMAGE_DIR: &str = "/var/spool/spur/images";
 const DEFAULT_CONTAINER_DIR: &str = "/var/spool/spur/containers";
 
-/// Return candidate image directories, honoring `SPUR_IMAGE_DIR` env var.
-///
-/// Returns all directories to search (in priority order) so that
-/// `resolve_image()` can find images regardless of which tier was used
-/// to import them.
-///
-/// Priority (issue #63 — fixes mismatch between CLI and agent):
-/// 1. `$SPUR_IMAGE_DIR` environment variable
-/// 2. `/var/spool/spur/images` if it exists and is readable
-/// 3. `~/.spur/images/` as user-local fallback
-///
-/// The CLI's `resolve_image_dir()` uses a writability check to decide
-/// where to *import* images, but the agent only needs *read* access to
-/// find them. We return all readable dirs so images imported to either
-/// the system dir or user dir are found.
-fn image_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Ok(dir) = std::env::var("SPUR_IMAGE_DIR") {
-        if !dir.is_empty() {
-            dirs.push(PathBuf::from(dir));
+/// Resolve the home directory of the job's submitting user via passwd lookup.
+fn resolve_job_user_home(job_user: Option<&str>, job_uid: Option<u32>) -> Option<PathBuf> {
+    if let Some(uid) = job_uid {
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+            return Some(user.dir);
         }
     }
+    if let Some(name) = job_user {
+        if let Ok(Some(user)) = nix::unistd::User::from_name(name) {
+            return Some(user.dir);
+        }
+    }
+    None
+}
 
-    let system_dir = Path::new(DEFAULT_IMAGE_DIR);
-    if system_dir.is_dir() {
+/// Pure composition of the image search path.
+///
+/// Filters each candidate by `is_dir()` and dedupes. This function does no
+/// I/O outside the existence check, takes no env or passwd dependencies, and
+/// is the unit-testable core of `image_dirs_for_job`.
+///
+/// Order:
+/// 1. `env_override` (no `is_dir()` filter — caller controls)
+/// 2. `system_dir` if it exists
+/// 3. `job_user_home/.spur/images` if it exists
+/// 4. `agent_home/.spur/images` if it exists
+///
+/// If everything is filtered out, falls back to `system_dir` so callers
+/// always get a non-empty list (used in error messages).
+fn compose_image_dirs(
+    env_override: Option<&Path>,
+    system_dir: &Path,
+    job_user_home: Option<&Path>,
+    agent_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    if let Some(d) = env_override {
+        dirs.push(d.to_path_buf());
+    }
+
+    if system_dir.is_dir() && !dirs.iter().any(|x| x == system_dir) {
         dirs.push(system_dir.to_path_buf());
     }
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let user_dir = PathBuf::from(home).join(".spur/images");
-        if !dirs.contains(&user_dir) {
+    for home in [job_user_home, agent_home].into_iter().flatten() {
+        let user_dir = home.join(".spur/images");
+        if user_dir.is_dir() && !dirs.contains(&user_dir) {
             dirs.push(user_dir);
         }
     }
@@ -63,9 +79,37 @@ fn image_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Return candidate image directories for a job, honoring `SPUR_IMAGE_DIR`
+/// env var and the submitting user's personal image store.
+///
+/// The agent only needs *read* access to find images. We return all readable
+/// dirs so images imported to either the system dir or a user's home dir are
+/// found.
+///
+/// Search order:
+/// 1. `$SPUR_IMAGE_DIR` environment variable
+/// 2. `/var/spool/spur/images` (system-wide store)
+/// 3. `~job_user/.spur/images` (submitting user's personal store)
+/// 4. `$HOME/.spur/images` (agent process fallback)
+fn image_dirs_for_job(job_user: Option<&str>, job_uid: Option<u32>) -> Vec<PathBuf> {
+    let env_override = std::env::var("SPUR_IMAGE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let job_user_home = resolve_job_user_home(job_user, job_uid);
+    let agent_home = std::env::var_os("HOME").map(PathBuf::from);
+
+    compose_image_dirs(
+        env_override.as_deref(),
+        Path::new(DEFAULT_IMAGE_DIR),
+        job_user_home.as_deref(),
+        agent_home.as_deref(),
+    )
+}
+
 /// Primary image directory (first candidate) — used for error messages.
 fn image_dir() -> PathBuf {
-    image_dirs()
+    image_dirs_for_job(None, None)
         .into_iter()
         .next()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_IMAGE_DIR))
@@ -132,9 +176,16 @@ pub struct ContainerConfig {
 ///
 /// Supports:
 /// - Absolute path to squashfs file
-/// - Image name (looked up in image_dir())
+/// - Image name (looked up in candidate image directories)
 /// - docker:// URI (must be pre-imported with `spur image import`)
-pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
+///
+/// `job_user` / `job_uid` identify the submitting user so we can search
+/// their personal image store (`~job_user/.spur/images`).
+pub fn resolve_image(
+    image: &str,
+    job_user: Option<&str>,
+    job_uid: Option<u32>,
+) -> anyhow::Result<PathBuf> {
     let path = Path::new(image);
 
     // Absolute path: use directly if it exists
@@ -154,9 +205,7 @@ pub fn resolve_image(image: &str) -> anyhow::Result<PathBuf> {
         }
     }
 
-    // Search all candidate directories (issue #63: CLI may import to ~/.spur/images
-    // while agent previously only checked /var/spool/spur/images)
-    let dirs = image_dirs();
+    let dirs = image_dirs_for_job(job_user, job_uid);
     let sanitized = sanitize_name(image);
 
     for dir in &dirs {
@@ -538,7 +587,13 @@ mount --bind {home} $ROOTFS{home} 2>/dev/null || true
     // User bind mounts
     for mount in &config.mounts {
         script.push_str(&format!(
-            "\nmkdir -p $ROOTFS{target}\nmount --bind \"{source}\" $ROOTFS{target} 2>/dev/null || true",
+            r#"
+if [ -f "{source}" ]; then
+  mkdir -p "$(dirname $ROOTFS{target})" && touch $ROOTFS{target}
+else
+  mkdir -p $ROOTFS{target}
+fi
+mount --bind "{source}" $ROOTFS{target} 2>/dev/null || true"#,
             source = mount.source,
             target = mount.target,
         ));
@@ -549,6 +604,18 @@ mount --bind {home} $ROOTFS{home} 2>/dev/null || true
             ));
         }
     }
+
+    // Bind-mount host DNS files so name resolution works inside the container.
+    script.push_str(
+        r#"
+for dns_file in /etc/resolv.conf /etc/hosts; do
+  if [ -f "$dns_file" ]; then
+    touch $ROOTFS$dns_file 2>/dev/null || true
+    mount --bind "$dns_file" $ROOTFS$dns_file 2>/dev/null || true
+  fi
+done
+"#,
+    );
 
     // Hook: config.d — source any system/user hook scripts
     script.push_str(
@@ -573,7 +640,13 @@ for fstab in /etc/spur/container.d/mounts.d/*.fstab; do
       src=$(echo "$line" | awk "{print \$1}")
       dst=$(echo "$line" | awk "{print \$2}")
       [ -n "$src" ] && [ -n "$dst" ] && {
-        mkdir -p $ROOTFS$dst
+        # Use touch for files, mkdir -p for directories — types must match.
+        if [ -f "$src" ]; then
+          mkdir -p "$(dirname $ROOTFS$dst)"
+          touch $ROOTFS$dst 2>/dev/null || true
+        else
+          mkdir -p $ROOTFS$dst
+        fi
         mount --bind "$src" $ROOTFS$dst 2>/dev/null || true
       }
     }
@@ -798,6 +871,15 @@ fn which(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialize tests that mutate `SPUR_IMAGE_DIR` (or any process-global
+    /// env var). Cargo runs tests in parallel within a binary, so without
+    /// a lock these races produce intermittent CI failures.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // --- Mount parsing ---
 
@@ -877,7 +959,7 @@ mod tests {
 
     #[test]
     fn test_resolve_image_not_found() {
-        let err = resolve_image("nonexistent-image-xyz").unwrap_err();
+        let err = resolve_image("nonexistent-image-xyz", None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not found"),
@@ -893,13 +975,13 @@ mod tests {
 
     #[test]
     fn test_resolve_image_absolute_path_not_found() {
-        let err = resolve_image("/nonexistent/path/to/image.sqsh").unwrap_err();
+        let err = resolve_image("/nonexistent/path/to/image.sqsh", None, None).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn test_resolve_image_docker_uri_not_imported() {
-        let err = resolve_image("docker://ubuntu:22.04").unwrap_err();
+        let err = resolve_image("docker://ubuntu:22.04", None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"));
         assert!(msg.contains("spur image import"));
@@ -909,7 +991,7 @@ mod tests {
     fn test_resolve_image_error_includes_directory() {
         // Regression: error message now shows which directory was searched (#35).
         // Makes it obvious when CLI and agent use different directories.
-        let err = resolve_image("missing-image").unwrap_err();
+        let err = resolve_image("missing-image", None, None).unwrap_err();
         let msg = err.to_string();
         // Error must tell user where we looked.
         assert!(
@@ -923,9 +1005,13 @@ mod tests {
     fn test_image_dir_default_without_env() {
         // Regression: agent used hardcoded /var/spool/spur/images ignoring env (#35 #23).
         // Without SPUR_IMAGE_DIR the function must return the system default.
-        // We unset the env var for this test to isolate behavior.
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
         std::env::remove_var("SPUR_IMAGE_DIR");
         let dir = image_dir();
+        if let Some(v) = prev {
+            std::env::set_var("SPUR_IMAGE_DIR", v);
+        }
         assert!(
             dir.to_str().unwrap().contains("spur"),
             "default image_dir must be under a spur path, got: {}",
@@ -938,14 +1024,186 @@ mod tests {
         // Regression: CLI used SPUR_IMAGE_DIR but agent did not (#35 #23).
         // Both must use the same env var so images imported by non-root users
         // (to e.g. ~/.spur/images) are found by the agent.
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
         std::env::set_var("SPUR_IMAGE_DIR", "/custom/image/store");
         let dir = image_dir();
-        std::env::remove_var("SPUR_IMAGE_DIR");
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
         assert_eq!(
             dir,
             std::path::PathBuf::from("/custom/image/store"),
             "SPUR_IMAGE_DIR env var must override the default image directory"
         );
+    }
+
+    #[test]
+    fn test_image_dirs_for_job_no_user_falls_back() {
+        let dirs = image_dirs_for_job(None, None);
+        assert!(
+            !dirs.is_empty(),
+            "image_dirs_for_job(None, None) must return at least one directory"
+        );
+    }
+
+    // --- #134: search submitting user's personal image store ---
+    //
+    // Regression: spurd previously only searched `/var/spool/spur/images`.
+    // When a user imported an image to `~/.spur/images` (no sudo),
+    // dispatch failed with "image not found".
+    //
+    // These tests use the pure `compose_image_dirs` to exercise the
+    // composition logic with synthetic paths, plus an end-to-end test
+    // that creates a real on-disk fixture and verifies `resolve_image`
+    // finds it.
+
+    #[test]
+    fn test_compose_image_dirs_includes_existing_user_home_dir() {
+        // Regression core: when the job's user has ~/.spur/images, it's
+        // added to the search path.
+        let user_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(user_home.path().join(".spur/images")).unwrap();
+
+        let dirs = compose_image_dirs(
+            None,
+            Path::new("/__spur_test_no_such_dir__"), // system_dir doesn't exist
+            Some(user_home.path()),
+            None,
+        );
+
+        let expected = user_home.path().join(".spur/images");
+        assert!(
+            dirs.contains(&expected),
+            "user .spur/images must be in dirs, got: {:?}",
+            dirs
+        );
+    }
+
+    #[test]
+    fn test_compose_image_dirs_skips_user_home_when_no_images_dir() {
+        // If the user's home exists but they haven't created .spur/images,
+        // don't pollute the search list.
+        let user_home = tempfile::tempdir().unwrap();
+        // Note: NOT creating .spur/images
+
+        let dirs = compose_image_dirs(
+            None,
+            Path::new("/__spur_test_no_such_dir__"),
+            Some(user_home.path()),
+            None,
+        );
+
+        let unexpected = user_home.path().join(".spur/images");
+        assert!(
+            !dirs.contains(&unexpected),
+            "non-existent user dir must not be in list, got: {:?}",
+            dirs
+        );
+    }
+
+    #[test]
+    fn test_compose_image_dirs_dedupes_user_home_against_agent_home() {
+        // If the agent and the job user share the same HOME (e.g. agent
+        // running as the user), don't list .spur/images twice.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".spur/images")).unwrap();
+
+        let dirs = compose_image_dirs(
+            None,
+            Path::new("/__spur_test_no_such_dir__"),
+            Some(home.path()),
+            Some(home.path()),
+        );
+
+        let expected = home.path().join(".spur/images");
+        let count = dirs.iter().filter(|d| **d == expected).count();
+        assert_eq!(count, 1, "must dedupe identical user/agent homes");
+    }
+
+    #[test]
+    fn test_compose_image_dirs_env_override_takes_precedence() {
+        let env_dir = tempfile::tempdir().unwrap();
+        let user_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(user_home.path().join(".spur/images")).unwrap();
+
+        let dirs = compose_image_dirs(
+            Some(env_dir.path()),
+            Path::new("/__spur_test_no_such_dir__"),
+            Some(user_home.path()),
+            None,
+        );
+
+        assert_eq!(
+            dirs[0],
+            env_dir.path().to_path_buf(),
+            "env override must be first"
+        );
+    }
+
+    #[test]
+    fn test_compose_image_dirs_empty_falls_back_to_system() {
+        // No env, no system dir, no user homes -> still get one entry
+        // (the placeholder system dir) for error-message purposes.
+        let dirs = compose_image_dirs(None, Path::new("/__spur_test_no_such_dir__"), None, None);
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/__spur_test_no_such_dir__")],
+            "must fall back to system_dir even when nothing exists"
+        );
+    }
+
+    #[test]
+    fn test_resolve_job_user_home_for_current_uid() {
+        // Proves the passwd lookup path works for a real uid. The current
+        // process's uid must be resolvable.
+        let uid = nix::unistd::Uid::current().as_raw();
+        let home = resolve_job_user_home(None, Some(uid));
+        assert!(home.is_some(), "current uid must resolve via passwd");
+        let home = home.unwrap();
+        assert!(home.is_absolute(), "home must be an absolute path");
+    }
+
+    #[test]
+    fn test_resolve_job_user_home_invalid_uid_returns_none() {
+        // A uid almost certainly absent from any passwd database.
+        let home = resolve_job_user_home(None, Some(0xFFFF_FFFE));
+        assert!(home.is_none(), "bogus uid must return None");
+    }
+
+    #[test]
+    fn test_resolve_image_finds_image_in_user_home_dir() {
+        // End-to-end regression for #134: when the user's .spur/images
+        // contains an image, resolve_image must find it via the
+        // job_user_home path.
+        //
+        // Threads the synthetic home through compose_image_dirs by setting
+        // SPUR_IMAGE_DIR. (The real production path goes uid -> passwd ->
+        // home; that is covered separately by
+        // test_resolve_job_user_home_for_current_uid +
+        // test_compose_image_dirs_includes_existing_user_home_dir.)
+        let images_dir = tempfile::tempdir().unwrap();
+        let image_path = images_dir.path().join("myimage.sqsh");
+        std::fs::write(&image_path, b"fake squashfs").unwrap();
+
+        // Use SPUR_IMAGE_DIR to inject a known dir into the search path.
+        // env_lock() serializes against other env-mutating tests in this
+        // module, since cargo runs tests in parallel within a binary.
+        let _guard = env_lock();
+        let prev = std::env::var_os("SPUR_IMAGE_DIR");
+        std::env::set_var("SPUR_IMAGE_DIR", images_dir.path());
+
+        let result = resolve_image("myimage", None, None);
+
+        // Restore env before asserting.
+        match prev {
+            Some(v) => std::env::set_var("SPUR_IMAGE_DIR", v),
+            None => std::env::remove_var("SPUR_IMAGE_DIR"),
+        }
+
+        let resolved = result.expect("resolve_image must find myimage.sqsh");
+        assert_eq!(resolved, image_path);
     }
 
     // --- GPU mounts ---
@@ -1113,6 +1371,82 @@ mod tests {
         assert!(script.contains("/mnt/data"));
         assert!(script.contains("remount,bind,ro"));
         assert!(script.contains("mount --bind \"/models\""));
+        // The else branch for directory mounts must emit mkdir -p.
+        assert!(script.contains("mkdir -p $ROOTFS/mnt/data"));
+    }
+
+    #[test]
+    fn test_launch_script_file_mount_uses_touch_not_mkdir() {
+        // File bind mounts must use touch, not mkdir -p — mismatched types fail silently.
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![BindMount {
+                source: "/etc/resolv.conf".into(),
+                target: "/etc/resolv.conf".into(),
+                readonly: true,
+            }],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        // The if branch must emit touch; the [ -f ] guard must be present.
+        assert!(
+            script.contains("touch $ROOTFS/etc/resolv.conf"),
+            "file mount must use touch, got:\n{}",
+            script
+        );
+        assert!(
+            script.contains("if [ -f \"/etc/resolv.conf\" ]"),
+            "file detection guard must be present"
+        );
+        assert!(script.contains("mount --bind \"/etc/resolv.conf\""));
+    }
+
+    #[test]
+    fn test_launch_script_dns_files_always_mounted() {
+        // DNS files must be auto-mounted even when the user specifies no mounts.
+        let config = ContainerConfig {
+            image: "test".into(),
+            mounts: vec![],
+            workdir: None,
+            name: None,
+            readonly: false,
+            mount_home: false,
+            remap_root: false,
+            gpu_devices: vec![],
+            environment: HashMap::new(),
+            container_env: HashMap::new(),
+            entrypoint: None,
+            uid: 1000,
+            gid: 1000,
+            username: "testuser".into(),
+            home_dir: "/home/testuser".into(),
+        };
+        let rootfs = Path::new("/tmp/test-rootfs");
+        let script = build_container_launch_script(&config, rootfs, "/tmp/inner.sh", 1).unwrap();
+
+        assert!(
+            script.contains("/etc/resolv.conf"),
+            "resolv.conf must be auto-mounted"
+        );
+        assert!(
+            script.contains("/etc/hosts"),
+            "/etc/hosts must be auto-mounted"
+        );
+        assert!(script.contains("touch $ROOTFS$dns_file"));
     }
 
     // --- Image removal ---
